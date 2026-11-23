@@ -16,12 +16,13 @@ const byCodeUnits = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
 
 // ---------------------------------------------------------------- text
 
-const ESC = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
 const HAS_ESC = /[&<>"']/;
-const ESC_RE = /[&<>"']/g;
 /** HTML-escape; fast path returns the string untouched when nothing needs it. */
 function esc(s) {
-  return HAS_ESC.test(s) ? s.replace(ESC_RE, (c) => ESC[c]) : s;
+  if (!HAS_ESC.test(s)) return s;
+  // '&' first, so the entities introduced here are not escaped again; string
+  // replacements (no per-match callback) are the fastest replace form here.
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
 /** JS \s: ASCII whitespace plus the Unicode whitespace code points. */
@@ -390,20 +391,8 @@ function findSingleStar(s, from) {
   return -1;
 }
 
-/** Index of the next inline-special character (` \ ` * [) at or after `i`, or s.length. */
-function nextSpecial(s, i) {
-  const n = s.length;
-  let m = n;
-  let j = s.indexOf('\\', i);
-  if (j !== -1 && j < m) m = j;
-  j = s.indexOf('`', i);
-  if (j !== -1 && j < m) m = j;
-  j = s.indexOf('*', i);
-  if (j !== -1 && j < m) m = j;
-  j = s.indexOf('[', i);
-  if (j !== -1 && j < m) m = j;
-  return m;
-}
+/** The inline-special characters (` \ ` * [), one regex scanned from `lastIndex`. */
+const INLINE_RE = /[\\`*[]/g;
 
 /** Render inline Markdown of `s` into `out` (array of string parts). */
 function inlineInto(s, env, out) {
@@ -411,7 +400,9 @@ function inlineInto(s, env, out) {
   let i = 0;
   let plain = 0;
   while (i < n) {
-    const sp = nextSpecial(s, i);
+    INLINE_RE.lastIndex = i;
+    const hit = INLINE_RE.exec(s);
+    const sp = hit === null ? n : hit.index;
     if (sp >= n) break;
     const c = s[sp];
     if (c === '\\') {
@@ -728,23 +719,24 @@ function truthy(v) {
   return v !== undefined && v !== null && v !== false && v !== '' && v !== 0;
 }
 
-function renderNodes(nodes, scope, ctx, depth, out) {
+function renderNodes(nodes, scope, ctx, depth) {
+  let s = '';
   for (let ni = 0; ni < nodes.length; ni++) {
     const n = nodes[ni];
     switch (n.kind) {
       case 'text':
-        out.push(n.text);
+        s += n.text;
         break;
       case 'var':
-        out.push(esc(textOf(lookup(scope, n.path))));
+        s += esc(textOf(lookup(scope, n.path)));
         break;
       case 'raw':
-        out.push(textOf(lookup(scope, n.path)));
+        s += textOf(lookup(scope, n.path));
         break;
       case 'if': {
         const v = truthy(lookup(scope, n.path));
         const branch = v !== n.not ? n.then : n.else;
-        if (branch !== null) renderNodes(branch, scope, ctx, depth, out);
+        if (branch !== null) s += renderNodes(branch, scope, ctx, depth);
         break;
       }
       case 'for': {
@@ -762,25 +754,26 @@ function renderNodes(nodes, scope, ctx, depth, out) {
           loop.index = k + 1;
           loop.first = k === 0;
           loop.last = k === xs.length - 1;
-          renderNodes(n.body, child, ctx, depth, out);
+          s += renderNodes(n.body, child, ctx, depth);
         }
         break;
       }
       case 'include': {
         const t = ctx.templates.get(n.name);
         if (t !== undefined && depth < INCLUDE_DEPTH) {
-          if (t.fn !== null) t.fn(scope, ctx, depth + 1, out, TPL_HELPERS);
-          else renderNodes(t.nodes, scope, ctx, depth + 1, out);
+          if (t.fn !== null) s += t.fn(scope, ctx, depth + 1, TPL_HELPERS);
+          else s += renderNodes(t.nodes, scope, ctx, depth + 1);
         }
         break;
       }
     }
   }
+  return s;
 }
 
 // ---------------------------------------------------------------- template compilation
 // A parsed template is compiled once per build into a plain JS function that
-// appends to `out`: no AST walk, no per-node dispatch, and path reads are
+// returns its rendered string: no AST walk, no per-node dispatch, and path reads are
 // direct scope/property accesses. If compilation ever fails, the interpreter
 // above (same semantics) renders instead.
 
@@ -801,13 +794,13 @@ function genNodes(nodes, lines) {
   for (const n of nodes) {
     switch (n.kind) {
       case 'text':
-        lines.push(`out.push(${JSON.stringify(n.text)});`);
+        lines.push(`s+=${JSON.stringify(n.text)};`);
         break;
       case 'var':
-        lines.push(`out.push(H.esc(H.txt(${pathExpr(n.path)})));`);
+        lines.push(`s+=H.esc(H.txt(${pathExpr(n.path)}));`);
         break;
       case 'raw':
-        lines.push(`out.push(H.txt(${pathExpr(n.path)}));`);
+        lines.push(`s+=H.txt(${pathExpr(n.path)});`);
         break;
       case 'if': {
         lines.push(`if(H.truthy(${pathExpr(n.path)})!==${n.not ? 'true' : 'false'}){`);
@@ -829,7 +822,7 @@ function genNodes(nodes, lines) {
         break;
       }
       case 'include':
-        lines.push(`if(depth<8){const t=ctx.templates.get(${JSON.stringify(n.name)});if(t!==undefined){if(t.fn!==null)t.fn(scope,ctx,depth+1,out,H);else H.render(t.nodes,scope,ctx,depth+1,out);}}`);
+        lines.push(`if(depth<8){const t=ctx.templates.get(${JSON.stringify(n.name)});if(t!==undefined){if(t.fn!==null)s+=t.fn(scope,ctx,depth+1,H);else s+=H.render(t.nodes,scope,ctx,depth+1);}}`);
         break;
     }
   }
@@ -837,9 +830,10 @@ function genNodes(nodes, lines) {
 
 function compileTemplate(nodes) {
   try {
-    const lines = [];
+    const lines = ['let s="";'];
     genNodes(nodes, lines);
-    return new Function('scope', 'ctx', 'depth', 'out', 'H', lines.join('\n'));
+    lines.push('return s;');
+    return new Function('scope', 'ctx', 'depth', 'H', lines.join('\n'));
   } catch {
     return null;
   }
@@ -1034,10 +1028,8 @@ export function run(input) {
     scope.posts = vars.posts;
     scope.pager = vars.pager;
     scope.tag = vars.tag;
-    const out = [];
-    if (t.fn !== null) t.fn(scope, ctx, 0, out, TPL_HELPERS);
-    else renderNodes(t.nodes, scope, ctx, 0, out);
-    return out.join('');
+    if (t.fn !== null) return t.fn(scope, ctx, 0, TPL_HELPERS);
+    return renderNodes(t.nodes, scope, ctx, 0);
   };
   for (const s of kept) output[`${s.outDir}/index.html`] = render(s.layout, { page: pageOf(s) });
   const per = input.site.per_page;
